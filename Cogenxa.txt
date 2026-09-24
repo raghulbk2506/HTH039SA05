@@ -1,0 +1,1658 @@
+/*
+   ============================================================
+   AQUASHIELD
+   AI-BASED DEFICIT-AWARE SMART IRRIGATION
+   KPR COLLEGE HACKATHON - TRACK 5
+   ============================================================
+
+   Hardware:
+   ESP32
+   3 x Soil Moisture Sensors
+   DHT11
+   0.96" I2C OLED SSD1306
+   YF-S201 Flow Sensor
+   HC-SR04 Ultrasonic Sensor
+   3 x Relay Modules
+   3 x 12V Solenoid Valves
+   3 x Zone LEDs
+   Warning LED
+   Buzzer
+   Rain Sensor - optional
+
+   WATER PATH:
+   Tank -> Pump -> Flow Sensor -> 3-way -> Valves -> Zones
+
+   Relay 1 -> Solenoid Valve 1
+   Relay 2 -> Solenoid Valve 2
+   Relay 3 -> Solenoid Valve 3
+
+   NOTE:
+   Pump is NOT software-controlled in this version because
+   all 3 relays are assigned to the 3 valves.
+*/
+
+
+// ============================================================
+// LIBRARIES
+// ============================================================
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+
+// ============================================================
+// OLED
+// ============================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+#define OLED_RESET -1
+#define OLED_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  OLED_RESET
+);
+
+
+// ============================================================
+// DHT11
+// ============================================================
+
+#define DHT_PIN 4
+#define DHT_TYPE DHT11
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+
+// ============================================================
+// SOIL MOISTURE SENSORS
+// ============================================================
+
+#define SOIL1_PIN 34
+#define SOIL2_PIN 35
+#define SOIL3_PIN 32
+
+int soilRaw[3];
+int soilPercent[3];
+
+
+// ============================================================
+// RELAYS / SOLENOID VALVES
+// ============================================================
+
+#define RELAY1_PIN 18
+#define RELAY2_PIN 19
+#define RELAY3_PIN 23
+
+/*
+   MANY relay modules are ACTIVE LOW.
+
+   If your relay turns ON when the ESP32 sends LOW:
+       RELAY_ACTIVE_LOW = true
+
+   If your relay turns ON when the ESP32 sends HIGH:
+       RELAY_ACTIVE_LOW = false
+*/
+#define RELAY_ACTIVE_LOW true
+
+
+// ============================================================
+// LEDs
+// ============================================================
+
+#define LED_ZONE1 13
+#define LED_ZONE2 14
+#define LED_ZONE3 26
+
+#define WARNING_LED 25
+
+
+// ============================================================
+// BUZZER
+// ============================================================
+
+#define BUZZER_PIN 2
+
+
+// ============================================================
+// FLOW SENSOR
+// ============================================================
+
+#define FLOW_PIN 27
+
+volatile unsigned long flowPulses = 0;
+
+// Typical YF-S201 approximation.
+// CALIBRATE YOUR ACTUAL SENSOR FOR FINAL DEMO.
+const float FLOW_PULSES_PER_LITER = 450.0;
+
+float totalWaterLiters = 0.0;
+float irrigationSessionLiters = 0.0;
+
+
+// ============================================================
+// ULTRASONIC SENSOR
+// ============================================================
+
+#define TRIG_PIN 5
+#define ECHO_PIN 33
+
+// Tank dimensions for your demo tank.
+// Adjust these after measuring your actual tank.
+const float TANK_HEIGHT_CM = 18.0;
+const float TANK_MIN_DISTANCE_CM = 2.0;
+
+
+// ============================================================
+// RAIN SENSOR
+// ============================================================
+
+/*
+   IMPORTANT:
+
+   Your rain sensor is a TWO-PIN type.
+
+   Do NOT directly connect a bare two-pin sensing plate
+   to an ESP32 GPIO until its interface circuit is known.
+
+   Keep this FALSE for now.
+
+   After we identify your rain sensor circuit, change:
+       RAIN_SENSOR_ENABLED = true
+   and set the correct pin.
+*/
+
+#define RAIN_SENSOR_ENABLED false
+
+#define RAIN_PIN 25
+
+bool raining = false;
+
+
+// ============================================================
+// IRRIGATION SETTINGS
+// ============================================================
+
+// Hard demo water quota
+// Example: 1.0 liter maximum per day/demo session.
+const float WATER_QUOTA_LITERS = 1.0;
+
+float remainingQuota = WATER_QUOTA_LITERS;
+
+
+// Soil moisture below this value can request irrigation.
+const int SOIL_DRY_THRESHOLD = 40;
+
+// Target moisture
+const int SOIL_TARGET = 65;
+
+// Minimum tank level required
+const int MIN_TANK_PERCENT = 15;
+
+
+// Maximum irrigation time per zone
+const unsigned long MAX_IRRIGATION_TIME = 15000;
+
+
+// Minimum irrigation volume before reassessing
+const float MIN_WATER_PER_SESSION = 0.02;
+
+
+// ============================================================
+// STATE VARIABLES
+// ============================================================
+
+int activeZone = -1;
+
+bool irrigationRunning = false;
+
+unsigned long irrigationStartTime = 0;
+
+float zoneWaterUsed[3] = {
+  0.0,
+  0.0,
+  0.0
+};
+
+unsigned long irrigationCount[3] = {
+  0,
+  0,
+  0
+};
+
+
+// ============================================================
+// SENSOR TIMERS
+// ============================================================
+
+unsigned long lastSensorRead = 0;
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastDecision = 0;
+
+const unsigned long SENSOR_INTERVAL = 2000;
+const unsigned long DISPLAY_INTERVAL = 1000;
+const unsigned long DECISION_INTERVAL = 3000;
+
+
+// ============================================================
+// SENSOR VALUES
+// ============================================================
+
+float temperature = 0.0;
+float humidity = 0.0;
+
+float tankDistance = 0.0;
+float tankPercent = 0.0;
+
+
+// ============================================================
+// FUNCTION DECLARATIONS
+// ============================================================
+
+void IRAM_ATTR flowPulse();
+
+void setupPins();
+
+void readSensors();
+
+void readSoilSensors();
+
+void readDHT();
+
+void readTankLevel();
+
+void readRainSensor();
+
+void calculateWaterUsed();
+
+void updateDisplay();
+
+void displayMain();
+
+void displayIrrigation();
+
+void makeIrrigationDecision();
+
+int calculatePriority(int zone);
+
+int findHighestPriorityZone();
+
+void startIrrigation(int zone);
+
+void stopIrrigation();
+
+void openValve(int zone);
+
+void closeAllValves();
+
+void setRelay(int relayPin, bool state);
+
+void setZoneLEDs(int zone);
+
+void alarmBeep();
+
+void warningBeep();
+
+void printStatus();
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(500);
+
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println("      AQUASHIELD SMART IRRIGATION");
+  Serial.println("======================================");
+
+  // ----------------------------------------------------------
+  // GPIO
+  // ----------------------------------------------------------
+
+  setupPins();
+
+
+  // ----------------------------------------------------------
+  // FLOW SENSOR INTERRUPT
+  // ----------------------------------------------------------
+
+  attachInterrupt(
+    digitalPinToInterrupt(FLOW_PIN),
+    flowPulse,
+    FALLING
+  );
+
+
+  // ----------------------------------------------------------
+  // DHT
+  // ----------------------------------------------------------
+
+  dht.begin();
+
+
+  // ----------------------------------------------------------
+  // OLED
+  // ----------------------------------------------------------
+
+  Wire.begin(21, 22);
+
+  if (!display.begin(
+        SSD1306_SWITCHCAPVCC,
+        OLED_ADDRESS
+      )) {
+
+    Serial.println("OLED not detected!");
+
+  } else {
+
+    Serial.println("OLED OK");
+
+    display.clearDisplay();
+
+    display.setTextColor(SSD1306_WHITE);
+
+    display.setTextSize(1);
+
+    display.setCursor(0, 0);
+    display.println("AquaShield");
+
+    display.setCursor(0, 15);
+    display.println("Smart Irrigation");
+
+    display.setCursor(0, 30);
+    display.println("Initializing...");
+
+    display.display();
+
+    delay(2000);
+  }
+
+
+  // ----------------------------------------------------------
+  // INITIALIZE VALUES
+  // ----------------------------------------------------------
+
+  closeAllValves();
+
+  digitalWrite(WARNING_LED, LOW);
+
+  digitalWrite(BUZZER_PIN, LOW);
+
+  setZoneLEDs(-1);
+
+
+  // ----------------------------------------------------------
+  // INITIAL SENSOR READ
+  // ----------------------------------------------------------
+
+  readSensors();
+
+  Serial.println("System ready.");
+  Serial.println();
+}
+
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+
+  unsigned long now = millis();
+
+
+  // ----------------------------------------------------------
+  // READ SENSORS
+  // ----------------------------------------------------------
+
+  if (now - lastSensorRead >= SENSOR_INTERVAL) {
+
+    lastSensorRead = now;
+
+    readSensors();
+
+    calculateWaterUsed();
+
+    printStatus();
+  }
+
+
+  // ----------------------------------------------------------
+  // DECISION ENGINE
+  // ----------------------------------------------------------
+
+  if (now - lastDecision >= DECISION_INTERVAL) {
+
+    lastDecision = now;
+
+    if (!irrigationRunning) {
+
+      makeIrrigationDecision();
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // IRRIGATION SAFETY CHECK
+  // ----------------------------------------------------------
+
+  if (irrigationRunning) {
+
+    // Maximum irrigation time
+    if (millis() - irrigationStartTime >
+        MAX_IRRIGATION_TIME) {
+
+      Serial.println(
+        "Maximum irrigation time reached."
+      );
+
+      stopIrrigation();
+    }
+
+
+    // Tank too low
+    if (tankPercent < MIN_TANK_PERCENT) {
+
+      Serial.println(
+        "Tank level too low!"
+      );
+
+      stopIrrigation();
+
+      digitalWrite(WARNING_LED, HIGH);
+
+      warningBeep();
+    }
+
+
+    // Quota exhausted
+    if (remainingQuota <= 0.0) {
+
+      Serial.println(
+        "Water quota exhausted!"
+      );
+
+      stopIrrigation();
+
+      digitalWrite(WARNING_LED, HIGH);
+
+      warningBeep();
+    }
+
+
+    // Rain detected
+    if (raining) {
+
+      Serial.println(
+        "Rain detected - stopping irrigation."
+      );
+
+      stopIrrigation();
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // STOP ZONE WHEN MOISTURE TARGET REACHED
+  // ----------------------------------------------------------
+
+  if (irrigationRunning &&
+      activeZone >= 0) {
+
+    if (soilPercent[activeZone] >= SOIL_TARGET) {
+
+      Serial.println(
+        "Target moisture reached."
+      );
+
+      stopIrrigation();
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // OLED UPDATE
+  // ----------------------------------------------------------
+
+  if (now - lastDisplayUpdate >= DISPLAY_INTERVAL) {
+
+    lastDisplayUpdate = now;
+
+    updateDisplay();
+  }
+}
+
+
+// ============================================================
+// GPIO SETUP
+// ============================================================
+
+void setupPins() {
+
+  // Relays
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(RELAY3_PIN, OUTPUT);
+
+
+  // LEDs
+  pinMode(LED_ZONE1, OUTPUT);
+  pinMode(LED_ZONE2, OUTPUT);
+  pinMode(LED_ZONE3, OUTPUT);
+
+  pinMode(WARNING_LED, OUTPUT);
+
+
+  // Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+
+
+  // Flow
+  pinMode(FLOW_PIN, INPUT_PULLUP);
+
+
+  // Ultrasonic
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+
+  // Rain
+  if (RAIN_SENSOR_ENABLED) {
+
+    pinMode(RAIN_PIN, INPUT_PULLUP);
+  }
+
+
+  // Turn everything off
+  closeAllValves();
+
+  setZoneLEDs(-1);
+
+  digitalWrite(WARNING_LED, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+
+// ============================================================
+// FLOW INTERRUPT
+// ============================================================
+
+void IRAM_ATTR flowPulse() {
+
+  flowPulses++;
+}
+
+
+// ============================================================
+// READ ALL SENSORS
+// ============================================================
+
+void readSensors() {
+
+  readSoilSensors();
+
+  readDHT();
+
+  readTankLevel();
+
+  readRainSensor();
+}
+
+
+// ============================================================
+// SOIL SENSOR
+// ============================================================
+
+void readSoilSensors() {
+
+  soilRaw[0] = analogRead(SOIL1_PIN);
+  soilRaw[1] = analogRead(SOIL2_PIN);
+  soilRaw[2] = analogRead(SOIL3_PIN);
+
+
+  /*
+     Capacitive soil sensors normally produce different
+     raw values depending on their calibration.
+
+     The values below are STARTING values only.
+
+     You should calibrate using:
+       dry soil
+       wet soil
+
+     If your sensor behaves opposite to this mapping,
+     reverse the values.
+  */
+
+  for (int i = 0; i < 3; i++) {
+
+    soilPercent[i] =
+      map(
+        soilRaw[i],
+        3000,
+        1200,
+        0,
+        100
+      );
+
+    soilPercent[i] =
+      constrain(
+        soilPercent[i],
+        0,
+        100
+      );
+  }
+}
+
+
+// ============================================================
+// DHT11
+// ============================================================
+
+void readDHT() {
+
+  float h = dht.readHumidity();
+
+  float t = dht.readTemperature();
+
+
+  if (!isnan(h)) {
+
+    humidity = h;
+  }
+
+
+  if (!isnan(t)) {
+
+    temperature = t;
+  }
+}
+
+
+// ============================================================
+// ULTRASONIC TANK LEVEL
+// ============================================================
+
+void readTankLevel() {
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+
+  unsigned long duration =
+    pulseIn(
+      ECHO_PIN,
+      HIGH,
+      30000
+    );
+
+
+  if (duration == 0) {
+
+    Serial.println(
+      "Ultrasonic timeout."
+    );
+
+    return;
+  }
+
+
+  tankDistance =
+    duration * 0.0343 / 2.0;
+
+
+  /*
+     Example:
+
+     Tank height = 18 cm
+     Sensor mounted at top
+
+     distance small -> tank full
+     distance large -> tank empty
+  */
+
+  float waterHeight =
+    TANK_HEIGHT_CM - tankDistance;
+
+
+  tankPercent =
+    (waterHeight / TANK_HEIGHT_CM) * 100.0;
+
+
+  tankPercent =
+    constrain(
+      tankPercent,
+      0,
+      100
+    );
+}
+
+
+// ============================================================
+// RAIN SENSOR
+// ============================================================
+
+void readRainSensor() {
+
+  if (!RAIN_SENSOR_ENABLED) {
+
+    raining = false;
+
+    return;
+  }
+
+
+  /*
+     THIS PART DEPENDS ON YOUR RAIN SENSOR INTERFACE.
+
+     For a digital rain module where LOW means rain:
+
+     raining = (digitalRead(RAIN_PIN) == LOW);
+
+     Do not enable this until your two-pin sensor has
+     been correctly interfaced.
+  */
+
+  raining =
+    (digitalRead(RAIN_PIN) == LOW);
+}
+
+
+// ============================================================
+// CALCULATE FLOW / WATER USED
+// ============================================================
+
+void calculateWaterUsed() {
+
+  noInterrupts();
+
+  unsigned long pulses =
+    flowPulses;
+
+  flowPulses = 0;
+
+  interrupts();
+
+
+  if (pulses == 0) {
+
+    return;
+  }
+
+
+  float liters =
+    (float)pulses /
+    FLOW_PULSES_PER_LITER;
+
+
+  totalWaterLiters += liters;
+
+  irrigationSessionLiters += liters;
+
+
+  if (irrigationRunning &&
+      activeZone >= 0) {
+
+    zoneWaterUsed[activeZone] += liters;
+
+    remainingQuota -= liters;
+
+    if (remainingQuota < 0) {
+
+      remainingQuota = 0;
+    }
+  }
+}
+
+
+// ============================================================
+// IRRIGATION DECISION ENGINE
+// ============================================================
+
+void makeIrrigationDecision() {
+
+  // ----------------------------------------------------------
+  // HARD QUOTA
+  // ----------------------------------------------------------
+
+  if (remainingQuota <= 0.0) {
+
+    Serial.println(
+      "DECISION: Quota exhausted."
+    );
+
+    digitalWrite(WARNING_LED, HIGH);
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // TANK SAFETY
+  // ----------------------------------------------------------
+
+  if (tankPercent < MIN_TANK_PERCENT) {
+
+    Serial.println(
+      "DECISION: Tank level too low."
+    );
+
+    digitalWrite(WARNING_LED, HIGH);
+
+    warningBeep();
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // RAIN
+  // ----------------------------------------------------------
+
+  if (raining) {
+
+    Serial.println(
+      "DECISION: Rain detected."
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // FIND HIGHEST PRIORITY ZONE
+  // ----------------------------------------------------------
+
+  int selectedZone =
+    findHighestPriorityZone();
+
+
+  if (selectedZone < 0) {
+
+    Serial.println(
+      "DECISION: No zone needs irrigation."
+    );
+
+    digitalWrite(WARNING_LED, LOW);
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // START IRRIGATION
+  // ----------------------------------------------------------
+
+  startIrrigation(selectedZone);
+}
+
+
+// ============================================================
+// CALCULATE ZONE PRIORITY
+// ============================================================
+
+int calculatePriority(int zone) {
+
+  int priority = 0;
+
+
+  // ----------------------------------------------------------
+  // DRYNESS PRIORITY
+  // ----------------------------------------------------------
+
+  if (soilPercent[zone] < 30) {
+
+    priority += 60;
+
+  } else if (soilPercent[zone] < 40) {
+
+    priority += 45;
+
+  } else if (soilPercent[zone] < 50) {
+
+    priority += 25;
+
+  } else {
+
+    priority += 0;
+  }
+
+
+  // ----------------------------------------------------------
+  // TEMPERATURE STRESS
+  // ----------------------------------------------------------
+
+  if (temperature >= 35) {
+
+    priority += 20;
+
+  } else if (temperature >= 32) {
+
+    priority += 10;
+  }
+
+
+  // ----------------------------------------------------------
+  // LOW HUMIDITY
+  // ----------------------------------------------------------
+
+  if (humidity < 40) {
+
+    priority += 10;
+
+  } else if (humidity < 55) {
+
+    priority += 5;
+  }
+
+
+  // ----------------------------------------------------------
+  // PRE-EMPTIVE WATERING DEMO RULE
+  // ----------------------------------------------------------
+
+  /*
+     This is NOT a real weather forecast.
+
+     It demonstrates the hackathon concept of
+     pre-emptive watering before heat/dry conditions.
+
+     Later this can be replaced by actual weather API
+     forecast data.
+  */
+
+  if (temperature >= 34 &&
+      humidity <= 45) {
+
+    priority += 15;
+  }
+
+
+  // ----------------------------------------------------------
+  // PREVENT ALREADY-WET ZONES
+  // ----------------------------------------------------------
+
+  if (soilPercent[zone] >= SOIL_TARGET) {
+
+    priority = 0;
+  }
+
+
+  return priority;
+}
+
+
+// ============================================================
+// FIND HIGHEST PRIORITY ZONE
+// ============================================================
+
+int findHighestPriorityZone() {
+
+  int bestZone = -1;
+
+  int bestPriority = 0;
+
+
+  for (int i = 0; i < 3; i++) {
+
+    int p =
+      calculatePriority(i);
+
+
+    Serial.print(
+      "Zone "
+    );
+
+    Serial.print(i + 1);
+
+    Serial.print(
+      " priority = "
+    );
+
+    Serial.println(p);
+
+
+    if (p > bestPriority) {
+
+      bestPriority = p;
+
+      bestZone = i;
+    }
+  }
+
+
+  return bestZone;
+}
+
+
+// ============================================================
+// START IRRIGATION
+// ============================================================
+
+void startIrrigation(int zone) {
+
+  if (zone < 0 ||
+      zone > 2) {
+
+    return;
+  }
+
+
+  if (remainingQuota <= 0) {
+
+    return;
+  }
+
+
+  if (tankPercent < MIN_TANK_PERCENT) {
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // CLOSE EVERYTHING FIRST
+  // ----------------------------------------------------------
+
+  closeAllValves();
+
+
+  // ----------------------------------------------------------
+  // SELECT ZONE
+  // ----------------------------------------------------------
+
+  activeZone = zone;
+
+  irrigationRunning = true;
+
+  irrigationStartTime =
+    millis();
+
+  irrigationSessionLiters = 0;
+
+
+  // ----------------------------------------------------------
+  // OPEN SELECTED VALVE
+  // ----------------------------------------------------------
+
+  openValve(zone);
+
+  setZoneLEDs(zone);
+
+
+  // ----------------------------------------------------------
+  // DISPLAY / SERIAL
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.print(
+    "IRRIGATION STARTED - ZONE "
+  );
+
+  Serial.println(
+    zone + 1
+  );
+
+  Serial.print(
+    "Soil = "
+  );
+
+  Serial.print(
+    soilPercent[zone]
+  );
+
+  Serial.println("%");
+
+
+  Serial.print(
+    "Priority = "
+  );
+
+  Serial.println(
+    calculatePriority(zone)
+  );
+
+
+  Serial.print(
+    "Remaining quota = "
+  );
+
+  Serial.print(
+    remainingQuota,
+    3
+  );
+
+  Serial.println(" L");
+
+
+  Serial.println(
+    "Pump should be running."
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+
+  irrigationCount[zone]++;
+
+  alarmBeep();
+}
+
+
+// ============================================================
+// STOP IRRIGATION
+// ============================================================
+
+void stopIrrigation() {
+
+  if (!irrigationRunning) {
+
+    closeAllValves();
+
+    setZoneLEDs(-1);
+
+    return;
+  }
+
+
+  closeAllValves();
+
+  setZoneLEDs(-1);
+
+
+  Serial.println();
+  Serial.println(
+    "--------------------------------"
+  );
+
+  Serial.print(
+    "IRRIGATION STOPPED - ZONE "
+  );
+
+  Serial.println(
+    activeZone + 1
+  );
+
+
+  Serial.print(
+    "Water used this session: "
+  );
+
+  Serial.print(
+    irrigationSessionLiters,
+    3
+  );
+
+  Serial.println(" L");
+
+
+  Serial.print(
+    "Remaining quota: "
+  );
+
+  Serial.print(
+    remainingQuota,
+    3
+  );
+
+  Serial.println(" L");
+
+
+  Serial.println(
+    "--------------------------------"
+  );
+
+
+  irrigationRunning = false;
+
+  activeZone = -1;
+
+  irrigationSessionLiters = 0;
+}
+
+
+// ============================================================
+// OPEN ONE VALVE
+// ============================================================
+
+void openValve(int zone) {
+
+  closeAllValves();
+
+
+  if (zone == 0) {
+
+    setRelay(
+      RELAY1_PIN,
+      true
+    );
+
+  } else if (zone == 1) {
+
+    setRelay(
+      RELAY2_PIN,
+      true
+    );
+
+  } else if (zone == 2) {
+
+    setRelay(
+      RELAY3_PIN,
+      true
+    );
+  }
+}
+
+
+// ============================================================
+// CLOSE ALL VALVES
+// ============================================================
+
+void closeAllValves() {
+
+  setRelay(
+    RELAY1_PIN,
+    false
+  );
+
+  setRelay(
+    RELAY2_PIN,
+    false
+  );
+
+  setRelay(
+    RELAY3_PIN,
+    false
+  );
+}
+
+
+// ============================================================
+// RELAY CONTROL
+// ============================================================
+
+void setRelay(
+  int relayPin,
+  bool state
+) {
+
+  if (RELAY_ACTIVE_LOW) {
+
+    digitalWrite(
+      relayPin,
+      state ? LOW : HIGH
+    );
+
+  } else {
+
+    digitalWrite(
+      relayPin,
+      state ? HIGH : LOW
+    );
+  }
+}
+
+
+// ============================================================
+// ZONE LEDS
+// ============================================================
+
+void setZoneLEDs(int zone) {
+
+  digitalWrite(
+    LED_ZONE1,
+    LOW
+  );
+
+  digitalWrite(
+    LED_ZONE2,
+    LOW
+  );
+
+  digitalWrite(
+    LED_ZONE3,
+    LOW
+  );
+
+
+  if (zone == 0) {
+
+    digitalWrite(
+      LED_ZONE1,
+      HIGH
+    );
+
+  } else if (zone == 1) {
+
+    digitalWrite(
+      LED_ZONE2,
+      HIGH
+    );
+
+  } else if (zone == 2) {
+
+    digitalWrite(
+      LED_ZONE3,
+      HIGH
+    );
+  }
+}
+
+
+// ============================================================
+// OLED UPDATE
+// ============================================================
+
+void updateDisplay() {
+
+  if (!display.width()) {
+
+    return;
+  }
+
+
+  display.clearDisplay();
+
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+  display.setTextSize(1);
+
+
+  // ----------------------------------------------------------
+  // LINE 1
+  // ----------------------------------------------------------
+
+  display.setCursor(0, 0);
+
+  display.print("AquaShield");
+
+
+  // ----------------------------------------------------------
+  // LINE 2
+  // ----------------------------------------------------------
+
+  display.setCursor(0, 10);
+
+  display.print("Z1:");
+  display.print(soilPercent[0]);
+
+  display.print("% Z2:");
+  display.print(soilPercent[1]);
+
+  display.print("%");
+
+
+  // ----------------------------------------------------------
+  // LINE 3
+  // ----------------------------------------------------------
+
+  display.setCursor(0, 20);
+
+  display.print("Z3:");
+  display.print(soilPercent[2]);
+
+  display.print("% T:");
+  display.print((int)temperature);
+
+  display.print("C");
+
+
+  // ----------------------------------------------------------
+  // LINE 4
+  // ----------------------------------------------------------
+
+  display.setCursor(0, 30);
+
+  display.print("Tank:");
+  display.print((int)tankPercent);
+
+  display.print("%");
+
+
+  // ----------------------------------------------------------
+  // LINE 5
+  // ----------------------------------------------------------
+
+  display.setCursor(0, 40);
+
+  display.print("Quota:");
+  display.print(remainingQuota, 2);
+
+  display.print("L");
+
+
+  // ----------------------------------------------------------
+  // LINE 6
+  // ----------------------------------------------------------
+
+  display.setCursor(0, 50);
+
+  if (irrigationRunning) {
+
+    display.print("IRRIGATING Z");
+    display.print(activeZone + 1);
+
+  } else {
+
+    display.print("System: READY");
+  }
+
+
+  display.display();
+}
+
+
+// ============================================================
+// BEEP
+// ============================================================
+
+void alarmBeep() {
+
+  digitalWrite(
+    BUZZER_PIN,
+    HIGH
+  );
+
+  delay(100);
+
+  digitalWrite(
+    BUZZER_PIN,
+    LOW
+  );
+}
+
+
+// ============================================================
+// WARNING BEEP
+// ============================================================
+
+void warningBeep() {
+
+  for (int i = 0; i < 2; i++) {
+
+    digitalWrite(
+      BUZZER_PIN,
+      HIGH
+    );
+
+    delay(150);
+
+    digitalWrite(
+      BUZZER_PIN,
+      LOW
+    );
+
+    delay(100);
+  }
+}
+
+
+// ============================================================
+// SERIAL MONITOR
+// ============================================================
+
+void printStatus() {
+
+  Serial.println();
+  Serial.println(
+    "========== SENSOR STATUS =========="
+  );
+
+
+  Serial.print(
+    "Soil Z1: "
+  );
+
+  Serial.print(
+    soilPercent[0]
+  );
+
+  Serial.print(
+    "%  Raw="
+  );
+
+  Serial.println(
+    soilRaw[0]
+  );
+
+
+  Serial.print(
+    "Soil Z2: "
+  );
+
+  Serial.print(
+    soilPercent[1]
+  );
+
+  Serial.print(
+    "%  Raw="
+  );
+
+  Serial.println(
+    soilRaw[1]
+  );
+
+
+  Serial.print(
+    "Soil Z3: "
+  );
+
+  Serial.print(
+    soilPercent[2]
+  );
+
+  Serial.print(
+    "%  Raw="
+  );
+
+  Serial.println(
+    soilRaw[2]
+  );
+
+
+  Serial.print(
+    "Temperature: "
+  );
+
+  Serial.print(
+    temperature
+  );
+
+  Serial.println(" C");
+
+
+  Serial.print(
+    "Humidity: "
+  );
+
+  Serial.print(
+    humidity
+  );
+
+  Serial.println(" %");
+
+
+  Serial.print(
+    "Tank: "
+  );
+
+  Serial.print(
+    tankPercent
+  );
+
+  Serial.println(" %");
+
+
+  Serial.print(
+    "Tank distance: "
+  );
+
+  Serial.print(
+    tankDistance
+  );
+
+  Serial.println(" cm");
+
+
+  Serial.print(
+    "Total water: "
+  );
+
+  Serial.print(
+    totalWaterLiters,
+    3
+  );
+
+  Serial.println(" L");
+
+
+  Serial.print(
+    "Remaining quota: "
+  );
+
+  Serial.print(
+    remainingQuota,
+    3
+  );
+
+  Serial.println(" L");
+
+
+  Serial.print(
+    "Rain: "
+  );
+
+  Serial.println(
+    raining ? "YES" : "NO"
+  );
+
+
+  Serial.println(
+    "==================================="
+  );
+}
